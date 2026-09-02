@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.checkpoint.jsonl
+*.checkpoint.jsonl.lock
+*.log
+*.out
+*.egg-info/
+build/
+dist/
+.venv/
+.DS_Store
