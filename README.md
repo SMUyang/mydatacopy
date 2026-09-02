@@ -1,67 +1,52 @@
-# md5-copy-cli
+# largefile-copy
 
-无第三方运行时依赖的目录树 MD5 校验与修复 CLI。
+无第三方运行时依赖的通用大文件目录树 MD5 校验与修复 CLI。
 
 ## 功能
 
-- 以 `--raw` 为基准，按相对路径校验 `--tmpfile`
-- 缺失文件从 raw 复制到目标目录
-- MD5 不一致文件从 raw 原子覆盖到目标目录
-- 复制后再次计算 MD5
+- 必须显式提供 `--source` 和 `--destination`，按相对路径比较两个目录树
+- 缺失文件从 source 原子复制到 destination
+- MD5 不一致文件从 source 原子覆盖到 destination
+- 复制后再次计算 MD5 复核
 - JSONL checkpoint 断点续跑
 - `--workers N` 并行处理不同文件
 - `--subdir DIR` 分片运行；父子分片自动互斥
+- 默认不排除任何目录；可重复指定 `--exclude-dir NAME`
 - TTY 下显示 ANSI TUI：总进度、worker 状态、速率和 ETA
 - 非 TTY 下输出普通事件日志
 - `--log` 记录带时间戳的 START/REPAIRED/ERROR/SUMMARY 事件
 - `EXTRA` 只报告，不删除
 
-默认排除目录名 `03.BQSR`，raw 和目标两侧都排除。
-
-## 目录
-
-```text
-md5-copy-cli/
-├── md5-copy       # 无安装启动器
-├── md5_copy.py    # CLI 主程序
-├── pyproject.toml # 可选安装配置
-└── README.md
-```
-
 ## 直接使用
 
 ```bash
-./md5-copy --help
-./md5-copy \
-  --raw /source/root \
-  --tmpfile /destination/root \
-  --checkpoint /path/checkpoint.jsonl \
-  --log /path/checkpoint.log \
+./largefile-copy --help
+./largefile-copy \
+  --source /path/to/source \
+  --destination /path/to/destination \
+  --checkpoint /path/to/checkpoint.jsonl \
+  --log /path/to/checkpoint.log \
   --workers 4
 ```
 
-前台 SSH 运行时直接显示 TUI：
+也可以直接运行 Python 模块：
 
 ```bash
-ssh hx@100.67.101.54
-/home/hx/md5-copy-cli/md5-copy \
-  --raw /mnt/elements-se/wgs \
-  --tmpfile /home/hx/AIP2/workspace/dataset/private/fragement/WGS_Raw \
-  --checkpoint /home/hx/md5-copy-cli/wgs_md5.checkpoint.jsonl \
-  --log /home/hx/md5-copy-cli/wgs_md5.log \
-  --workers 4
+python3 largefile_copy.py --help
 ```
 
-后台运行时使用 `-u`：
+目标目录不存在时会在复制首个文件时自动创建。默认 checkpoint 为当前目录的 `.largefile-copy.checkpoint.jsonl`；指定 `--subdir` 且未显式指定 checkpoint 时，使用 `checkpoints/` 下按分片命名的 checkpoint。`--log` 默认与 checkpoint 同名但扩展名为 `.log`。
+
+## 排除目录
+
+默认扫描 source 和 destination 下的全部目录。只在明确需要时指定排除项，可重复使用参数：
 
 ```bash
-nohup python3 -u /home/hx/md5-copy-cli/md5_copy.py \
-  --raw /mnt/elements-se/wgs \
-  --tmpfile /home/hx/AIP2/workspace/dataset/private/fragement/WGS_Raw \
-  --checkpoint /home/hx/md5-copy-cli/wgs_md5.checkpoint.jsonl \
-  --log /home/hx/md5-copy-cli/wgs_md5.log \
-  --workers 4 \
-  > /home/hx/md5-copy-cli/wgs_md5.out 2>&1 </dev/null &
+./largefile-copy \
+  --source /path/to/source \
+  --destination /path/to/destination \
+  --exclude-dir cache \
+  --exclude-dir temporary
 ```
 
 ## 分片并行
@@ -69,23 +54,23 @@ nohup python3 -u /home/hx/md5-copy-cli/md5_copy.py \
 不同目录可以分别启动，每个分片拥有独立 checkpoint 和 lock：
 
 ```bash
-./md5-copy --raw /source --tmpfile /target \
+./largefile-copy --source /source --destination /target \
   --subdir outputs --workers 2
 
-./md5-copy --raw /source --tmpfile /target \
-  --subdir bam_qc_endmer --workers 2
+./largefile-copy --source /source --destination /target \
+  --subdir reports --workers 2
 ```
 
-不要同时运行重叠分片，例如 `outputs` 与 `outputs/final_bam`。全量运行也会与任意分片运行互斥。
+不要同时运行重叠分片，例如 `outputs` 与 `outputs/final`。全量运行也会与任意分片运行互斥。
 
-## 断点
+## 断点续跑
 
-同一命令重新运行会自动复用 checkpoint。当前 raw/tmpfile 文件签名未变化的完成项会跳过；变化、缺失或目标文件消失的项会重新检查。
+同一命令重新运行会自动复用 checkpoint。当前 source/destination 文件签名未变化的完成项会跳过；变化、缺失或目标文件消失的项会重新检查。
 
 从头运行某个分片：
 
 ```bash
-./md5-copy --raw /source --tmpfile /target \
+./largefile-copy --source /source --destination /target \
   --subdir outputs --restart
 ```
 
@@ -106,7 +91,7 @@ python3 -m pip install --user /Users/hyan/md5-copy-cli
 安装后使用：
 
 ```bash
-md5-copy --help
+largefile-copy --help
 ```
 
 CLI 使用纯 Python 标准库，不需要额外运行时依赖。

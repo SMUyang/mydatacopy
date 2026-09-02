@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""Compare dataset/private/raw with tmpfile and repair tmpfile from raw.
+"""Verify and repair a destination directory against a source directory.
 
-Run directly on the server over SSH:
-
-    ssh -p 31619 root@aipaas2.miracle.ac.cn \
-        'python3 /workspace/scripts/check_raw_tmpfile_md5.py'
-
-The default paths are server-side paths.  ``03.BQSR`` is excluded from both
-source and destination trees because it contains the large BAM collection.
-Use ``--subdir`` with disjoint relative directories to run multiple processes;
-each shard gets its own checkpoint and lock by default.
-
-A live ANSI progress display renders on a TTY (per-worker progress bars, ETA,
-event feed); on a non-TTY (nohup/cron) it degrades to plain event lines.  All
-events are also appended to ``--log`` with timestamps.
+The command compares files by relative path, repairs missing or mismatched
+destination files from the source, and resumes safely from a JSONL checkpoint.
+It uses only the Python standard library and provides TTY progress reporting,
+durable event logs, atomic copies, and protections for overlapping shards.
 """
 
 from __future__ import annotations
@@ -35,15 +26,12 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Callable, Iterator
+from typing import Callable, Collection, Iterator
 
 
 CHUNK_SIZE = 8 * 1024 * 1024
-DEFAULT_RAW = Path("/workspace/dataset/private/raw")
-DEFAULT_CHECKPOINT = Path("/workspace/scripts/check_raw_tmpfile_md5.checkpoint.jsonl")
+DEFAULT_CHECKPOINT = Path(".largefile-copy.checkpoint.jsonl")
 CHECKPOINT_VERSION = 1
-DEFAULT_TMPFILE = Path("/workspace/dataset/private/tmpfile")
-DEFAULT_EXCLUDED_DIR = "03.BQSR"
 RENDER_INTERVAL = 0.5
 RATE_WINDOW = 15.0
 
@@ -52,12 +40,13 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
-def iter_files(root: Path, excluded_dir: str) -> Iterator[tuple[Path, Path]]:
+def iter_files(root: Path, excluded_dirs: Collection[str] = ()) -> Iterator[tuple[Path, Path]]:
     """Yield ``(relative_path, absolute_path)`` for files below root."""
+    excluded = set(excluded_dirs)
     for directory, dirnames, filenames in os.walk(
         root, topdown=True, followlinks=False, onerror=_raise_walk_error,
     ):
-        dirnames[:] = sorted(name for name in dirnames if name != excluded_dir)
+        dirnames[:] = sorted(name for name in dirnames if name not in excluded)
         for name in dirnames + filenames:
             path = Path(directory) / name
             if path.is_symlink() and not path.exists():
@@ -68,9 +57,8 @@ def iter_files(root: Path, excluded_dir: str) -> Iterator[tuple[Path, Path]]:
                 yield path.relative_to(root), path
 
 
-def collect_files(root: Path, excluded_dir: str) -> dict[Path, Path]:
-    return dict(iter_files(root, excluded_dir))
-
+def collect_files(root: Path, excluded_dirs: Collection[str] = ()) -> dict[Path, Path]:
+    return dict(iter_files(root, excluded_dirs))
 
 def md5_file(path: Path, progress: Callable[[int, int], None] | None = None) -> str:
     digest = hashlib.md5()
@@ -140,10 +128,118 @@ def checkpoint_config(args: argparse.Namespace) -> dict[str, object]:
     return {
         "type": "header",
         "version": CHECKPOINT_VERSION,
-        "raw": str(args.raw.resolve()),
-        "tmpfile": str(args.tmpfile.resolve()),
-        "exclude_dir": args.exclude_dir,
+        "source": str(args.source.resolve()),
+        "destination": str(args.destination.resolve()),
+        "exclude_dirs": list(args.exclude_dir),
         "subdir": args.subdir.as_posix() if args.subdir else "",
+    }
+
+def checkpoint_reusable(
+    record: dict[str, object],
+    source_path: Path,
+    destination_path: Path | None,
+) -> bool:
+    if record.get("status") not in {"match", "repaired_missing", "repaired_mismatch"}:
+        return False
+    if destination_path is None or not destination_path.is_file():
+        return False
+    try:
+        return (
+            record.get("source_signature") == file_signature(source_path)
+            and record.get("destination_signature") == file_signature(destination_path)
+        )
+    except OSError:
+        return False
+
+
+def process_file(
+    relative_path: Path,
+    source_path: Path,
+    destination_path: Path | None,
+    destination_root: Path,
+    check_only: bool,
+    slot: "WorkerSlot | None" = None,
+) -> dict[str, object]:
+    def report(phase: str) -> Callable[[int, int], None]:
+        if slot is None:
+            return lambda done, total: None
+        name = relative_path.as_posix()
+        def cb(done: int, total: int) -> None:
+            slot.file = name
+            slot.phase = phase
+            slot.done = done
+            slot.total = total
+        return cb
+
+    if slot is not None:
+        slot.file = relative_path.as_posix()
+        slot.phase = "md5"
+        slot.done = 0
+        slot.total = source_path.stat().st_size
+
+    source_signature = file_signature(source_path)
+    source_md5 = md5_file(source_path, progress=report("md5"))
+    if file_signature(source_path) != source_signature:
+        raise OSError("source file changed while reading; retry this file")
+
+    if destination_path is None or not destination_path.is_file():
+        if check_only:
+            return {
+                "type": "result",
+                "relative": relative_path.as_posix(),
+                "status": "missing",
+                "source_md5": source_md5,
+            }
+        destination = destination_root / relative_path
+        copy_atomic(source_path, destination, progress=report("copy"))
+        repaired_md5 = md5_file(destination, progress=report("verify"))
+        if repaired_md5 != source_md5:
+            raise OSError("MD5 mismatch after copy")
+        return {
+            "type": "file",
+            "relative": relative_path.as_posix(),
+            "status": "repaired_missing",
+            "source_md5": source_md5,
+            "destination_md5": None,
+            "source_signature": file_signature(source_path),
+            "destination_signature": file_signature(destination),
+        }
+
+    destination_signature = file_signature(destination_path)
+    destination_md5 = md5_file(destination_path, progress=report("md5-destination"))
+    if file_signature(destination_path) != destination_signature:
+        raise OSError("destination file changed while reading; retry this file")
+    if destination_md5 == source_md5:
+        return {
+            "type": "file",
+            "relative": relative_path.as_posix(),
+            "status": "match",
+            "source_md5": source_md5,
+            "destination_md5": destination_md5,
+            "source_signature": source_signature,
+            "destination_signature": destination_signature,
+        }
+    if check_only:
+        return {
+            "type": "result",
+            "relative": relative_path.as_posix(),
+            "status": "mismatch",
+            "source_md5": source_md5,
+            "destination_md5": destination_md5,
+        }
+
+    copy_atomic(source_path, destination_path, progress=report("copy"))
+    repaired_md5 = md5_file(destination_path, progress=report("verify"))
+    if repaired_md5 != source_md5:
+        raise OSError("MD5 mismatch after copy")
+    return {
+        "type": "file",
+        "relative": relative_path.as_posix(),
+        "status": "repaired_mismatch",
+        "source_md5": source_md5,
+        "destination_md5": destination_md5,
+        "source_signature": file_signature(source_path),
+        "destination_signature": file_signature(destination_path),
     }
 
 
@@ -245,11 +341,18 @@ def checker_subdir_parts(argv: list[str]) -> tuple[str, ...] | None:
 
 
 def checker_process_scope(argv: list[str], script_name: str) -> tuple[bool, bool]:
-    if not argv or not Path(argv[0]).name.lower().startswith("python"):
+    if not argv:
         return False, False
-    if not any(Path(item).name == script_name for item in argv[1:]):
+    program = Path(argv[0]).name
+    if program == "largefile-copy":
+        return True, checker_subdir_parts(argv) is not None
+    if not program.lower().startswith("python"):
         return False, False
-    return True, checker_subdir_parts(argv) is not None
+    if len(argv) >= 3 and argv[1] == "-m" and argv[2] == "largefile_copy":
+        return True, checker_subdir_parts(argv) is not None
+    if len(argv) >= 2 and Path(argv[1]).name == script_name:
+        return True, checker_subdir_parts(argv) is not None
+    return False, False
 
 
 def shards_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
@@ -284,113 +387,6 @@ def conflicting_checker_pids(subdir: Path | None) -> list[int]:
     return conflicts
 
 
-def checkpoint_reusable(
-    record: dict[str, object],
-    raw_path: Path,
-    tmp_path: Path | None,
-) -> bool:
-    if record.get("status") not in {"match", "repaired_missing", "repaired_mismatch"}:
-        return False
-    if tmp_path is None or not tmp_path.is_file():
-        return False
-    try:
-        return (
-            record.get("raw_signature") == file_signature(raw_path)
-            and record.get("tmp_signature") == file_signature(tmp_path)
-        )
-    except OSError:
-        return False
-
-
-def process_file(
-    relative_path: Path,
-    raw_path: Path,
-    tmp_path: Path | None,
-    tmp_root: Path,
-    check_only: bool,
-    slot: "WorkerSlot | None" = None,
-) -> dict[str, object]:
-    def report(phase: str) -> Callable[[int, int], None]:
-        if slot is None:
-            return lambda done, total: None
-        name = relative_path.as_posix()
-        def cb(done: int, total: int) -> None:
-            slot.file = name
-            slot.phase = phase
-            slot.done = done
-            slot.total = total
-        return cb
-
-    if slot is not None:
-        slot.file = relative_path.as_posix()
-        slot.phase = "md5"
-        slot.done = 0
-        slot.total = raw_path.stat().st_size
-
-    raw_signature = file_signature(raw_path)
-    raw_md5 = md5_file(raw_path, progress=report("md5"))
-    if file_signature(raw_path) != raw_signature:
-        raise OSError("raw file changed while reading; retry this file")
-
-    if tmp_path is None or not tmp_path.is_file():
-        if check_only:
-            return {
-                "type": "result",
-                "relative": relative_path.as_posix(),
-                "status": "missing",
-                "raw_md5": raw_md5,
-            }
-        destination = tmp_root / relative_path
-        copy_atomic(raw_path, destination, progress=report("copy"))
-        repaired_md5 = md5_file(destination, progress=report("verify"))
-        if repaired_md5 != raw_md5:
-            raise OSError("MD5 mismatch after copy")
-        return {
-            "type": "file",
-            "relative": relative_path.as_posix(),
-            "status": "repaired_missing",
-            "raw_md5": raw_md5,
-            "tmp_md5": None,
-            "raw_signature": file_signature(raw_path),
-            "tmp_signature": file_signature(destination),
-        }
-
-    tmp_signature = file_signature(tmp_path)
-    tmp_md5 = md5_file(tmp_path, progress=report("md5-tmp"))
-    if file_signature(tmp_path) != tmp_signature:
-        raise OSError("tmpfile changed while reading; retry this file")
-    if tmp_md5 == raw_md5:
-        return {
-            "type": "file",
-            "relative": relative_path.as_posix(),
-            "status": "match",
-            "raw_md5": raw_md5,
-            "tmp_md5": tmp_md5,
-            "raw_signature": raw_signature,
-            "tmp_signature": tmp_signature,
-        }
-    if check_only:
-        return {
-            "type": "result",
-            "relative": relative_path.as_posix(),
-            "status": "mismatch",
-            "raw_md5": raw_md5,
-            "tmp_md5": tmp_md5,
-        }
-
-    copy_atomic(raw_path, tmp_path, progress=report("copy"))
-    repaired_md5 = md5_file(tmp_path, progress=report("verify"))
-    if repaired_md5 != raw_md5:
-        raise OSError("MD5 mismatch after copy")
-    return {
-        "type": "file",
-        "relative": relative_path.as_posix(),
-        "status": "repaired_mismatch",
-        "raw_md5": raw_md5,
-        "tmp_md5": tmp_md5,
-        "raw_signature": file_signature(raw_path),
-        "tmp_signature": file_signature(tmp_path),
-    }
 
 
 # ---------------------------------------------------------------- progress UI
@@ -591,13 +587,13 @@ class ProgressTracker:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare raw and tmpfile by relative path, repair missing or "
-            "mismatched tmpfile files, and resume from a durable checkpoint."
+            "Compare source and destination directory trees by relative path, "
+            "repair differences, and resume from a durable checkpoint."
         ),
         epilog="exit 0=clean/repaired, 1=--check-only found differences, 2=error",
     )
-    parser.add_argument("--raw", type=Path, default=DEFAULT_RAW)
-    parser.add_argument("--tmpfile", type=Path, default=DEFAULT_TMPFILE)
+    parser.add_argument("--source", type=Path, required=True, help="source directory")
+    parser.add_argument("--destination", type=Path, required=True, help="destination directory")
     parser.add_argument(
         "--subdir",
         type=Path,
@@ -605,14 +601,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--exclude-dir",
-        default=DEFAULT_EXCLUDED_DIR,
-        help=f"directory name excluded from both trees (default: {DEFAULT_EXCLUDED_DIR})",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="directory name to exclude from both trees; repeat for multiple names",
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
         default=None,
-        help=f"server-side JSONL checkpoint (default: {DEFAULT_CHECKPOINT})",
+        help=f"JSONL checkpoint (default: {DEFAULT_CHECKPOINT})",
     )
     parser.add_argument(
         "--log",
@@ -644,10 +642,10 @@ def parse_args() -> argparse.Namespace:
             or any(part in {"", ".", ".."} for part in args.subdir.parts)
         ):
             parser.error("--subdir must be a non-empty relative path without . or ..")
-        if args.exclude_dir in args.subdir.parts:
-            parser.error(f"--subdir cannot include excluded directory {args.exclude_dir}")
-        args.raw = args.raw / args.subdir
-        args.tmpfile = args.tmpfile / args.subdir
+        if any(part in args.exclude_dir for part in args.subdir.parts):
+            parser.error("--subdir cannot include an excluded directory")
+        args.source = args.source / args.subdir
+        args.destination = args.destination / args.subdir
     if args.checkpoint is None:
         if args.subdir is None:
             args.checkpoint = DEFAULT_CHECKPOINT
@@ -667,11 +665,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if not args.raw.is_dir():
-        print(f"ERROR missing raw directory: {args.raw}", file=sys.stderr)
+    if not args.source.is_dir():
+        print(f"ERROR missing source directory: {args.source}", file=sys.stderr)
         return 2
-    if args.tmpfile.exists() and not args.tmpfile.is_dir():
-        print(f"ERROR tmpfile path is not a directory: {args.tmpfile}", file=sys.stderr)
+    if args.destination.exists() and not args.destination.is_dir():
+        print(f"ERROR destination path is not a directory: {args.destination}", file=sys.stderr)
         return 2
     conflicts = conflicting_checker_pids(args.subdir)
     if conflicts:
@@ -685,8 +683,8 @@ def main() -> int:
     lock_handle = None
     try:
         lock_handle = acquire_run_lock(args.checkpoint)
-        raw_files = collect_files(args.raw, args.exclude_dir)
-        tmp_files = collect_files(args.tmpfile, args.exclude_dir) if args.tmpfile.is_dir() else {}
+        source_files = collect_files(args.source, args.exclude_dir)
+        destination_files = collect_files(args.destination, args.exclude_dir) if args.destination.is_dir() else {}
         records = load_checkpoint(args.checkpoint, checkpoint_config(args), args.restart)
     except OSError as error:
         if lock_handle is not None:
@@ -700,45 +698,62 @@ def main() -> int:
     )
 
     total_bytes = 0
-    raw_sizes: dict[Path, int] = {}
+    source_sizes: dict[Path, int] = {}
     pending: list[tuple[Path, Path, Path | None]] = []
     resumed = 0
     resumed_bytes = 0
-    for relative_path in sorted(raw_files):
-        raw_path = raw_files[relative_path]
-        size = raw_path.stat().st_size
-        raw_sizes[relative_path] = size
-        total_bytes += size
-        tmp_path = tmp_files.get(relative_path)
-        record = records.get(relative_path.as_posix())
-        if record and checkpoint_reusable(record, raw_path, tmp_path):
-            resumed += 1
-            resumed_bytes += size
-            continue
-        pending.append((relative_path, raw_path, tmp_path))
-
     interactive = sys.stdout.isatty()
     tracker = ProgressTracker(
         workers=args.workers,
-        total_files=len(raw_files),
-        total_bytes=total_bytes,
-        done_files=resumed,
-        done_bytes=resumed_bytes,
+        total_files=len(source_files),
+        total_bytes=0,
+        done_files=0,
+        done_bytes=0,
         log_path=args.log,
         interactive=interactive,
     )
-    tracker.event("START", f"subdir={args.subdir.as_posix() if args.subdir else '/'} total={len(raw_files)} files "
+    try:
+        for relative_path in sorted(source_files):
+            source_path = source_files[relative_path]
+            size = source_path.stat().st_size
+            source_sizes[relative_path] = size
+            total_bytes += size
+            destination_path = destination_files.get(relative_path)
+            record = records.get(relative_path.as_posix())
+            if record and checkpoint_reusable(record, source_path, destination_path):
+                resumed += 1
+                resumed_bytes += size
+                continue
+            pending.append((relative_path, source_path, destination_path))
+    except OSError as error:
+        tracker.counts["errors"] += 1
+        tracker.counts["resumed"] = resumed
+        tracker.event("ERROR", f"planning: {error}")
+        tracker.event(
+            "SUMMARY",
+            f"resumed={resumed} match=0 repaired_missing=0 repaired_mismatch=0 "
+            f"detected_missing=0 detected_mismatch=0 extra=0 errors=1",
+        )
+        tracker.stop_rendering()
+        if lock_handle is not None:
+            release_run_lock(lock_handle)
+        print(f"ERROR planning scan: {error}", file=sys.stderr)
+        return 2
+
+    tracker.total_bytes = total_bytes
+    tracker.done_files = resumed
+    tracker.done_bytes = resumed_bytes
+    tracker.event("START", f"subdir={args.subdir.as_posix() if args.subdir else '/'} total={len(source_files)} files "
                            f"{fmt_bytes(total_bytes)} resumed={resumed} pending={len(pending)}")
 
-    def run_one(relative_path: Path, raw_path: Path, tmp_path: Path | None):
+    def run_one(relative_path: Path, source_path: Path, destination_path: Path | None):
         slot = tracker.acquire_slot()
         file_bytes = 0
         try:
-            result = process_file(
-                relative_path, raw_path, tmp_path, args.tmpfile,
+            return process_file(
+                relative_path, source_path, destination_path, args.destination,
                 args.check_only, slot,
             )
-            return result
         finally:
             if slot.phase != "idle":
                 file_bytes = slot.done
@@ -751,13 +766,13 @@ def main() -> int:
     tracker.start_rendering()
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            for relative_path, raw_path, tmp_path in pending:
-                future = executor.submit(run_one, relative_path, raw_path, tmp_path)
+            for relative_path, source_path, destination_path in pending:
+                future = executor.submit(run_one, relative_path, source_path, destination_path)
                 future_to_relative[future] = relative_path
 
             for future in as_completed(future_to_relative):
                 relative_path = future_to_relative[future]
-                size = raw_sizes[relative_path]
+                size = source_sizes[relative_path]
                 try:
                     result = future.result()
                 except OSError as error:
@@ -788,7 +803,7 @@ def main() -> int:
                         tracker.counts["errors"] += 1
                         tracker.event("ERROR", f"checkpoint {relative_path}: {error}")
 
-        for relative_path in sorted(set(tmp_files) - set(raw_files)):
+        for relative_path in sorted(set(destination_files) - set(source_files)):
             tracker.counts["extra"] += 1
             tracker.event("EXTRA", f"{relative_path}")
     except KeyboardInterrupt:
@@ -818,6 +833,7 @@ def main() -> int:
     if args.check_only and (counts["detected_missing"] or counts["detected_mismatch"]):
         return 1
     return 0
+
 
 
 if __name__ == "__main__":

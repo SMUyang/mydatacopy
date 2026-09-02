@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "md5-copy-cli"
+name = "largefile-copy"
 version = "1.0.0"
 description = "Parallel, resumable MD5 verification and repair for directory trees"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-md5-copy = "md5_copy:main"
+largefile-copy = "largefile_copy:main"
 
 [tool.setuptools]
-py-modules = ["md5_copy"]
+py-modules = ["largefile_copy"]
