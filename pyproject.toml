@@ -11,6 +11,7 @@ dependencies = []
 
 [project.scripts]
 largefile-copy = "largefile_copy:main"
+oss-download = "oss_download:main"
 
 [tool.setuptools]
-py-modules = ["largefile_copy"]
+py-modules = ["largefile_copy", "oss_download"]

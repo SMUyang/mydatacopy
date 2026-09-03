@@ -95,3 +95,63 @@ largefile-copy --help
 ```
 
 CLI 使用纯 Python 标准库，不需要额外运行时依赖。
+
+## OSS download（ossutil 2.x）
+
+`oss-download` 是跨 Linux、macOS 和 Windows 的仅下载封装，底层调用官方 Alibaba Cloud `ossutil` 2.x。它只执行下载方向的 `ossutil cp`，不上传、不删除、不执行 OSS-to-OSS copy，也不会自动启用 destructive 选项。
+
+### 配置凭据
+
+先使用官方交互式配置向导保存 ossutil 配置/profile。输入 Secret 时由 ossutil 隐藏输入；本项目不会读取或打印 Secret：
+
+```bash
+# Linux/macOS
+./oss-download configure --config-file /path/to/ossutil.ini --profile work
+
+# Windows PowerShell
+python .\oss_download.py configure --config-file C:\path\ossutil.ini --profile work
+```
+
+如果当前 ossutil 版本不接受 `--profile`，命令会给出提示，可去掉该选项重试。不要把 AccessKey Secret 写进命令行、脚本、README 或日志。下载命令默认复用 ossutil 配置；只有显式指定 `--prompt-credentials` 时才会隐藏提示一次性凭据，且 Secret 只通过子进程环境传递。也可以预先设置 `OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET` 和 `OSS_REGION` 环境变量。
+
+### 单对象与递归下载
+
+`--source` 必须是 `oss://bucket/key` 或 `oss://bucket/prefix`，`--destination` 是本地文件或目录：
+
+```bash
+# Linux/macOS
+./oss-download download \
+  --source oss://bucket/path/to/object \
+  --destination /path/to/object
+
+./oss-download download \
+  --source oss://bucket/path/to/prefix \
+  --destination /path/to/downloads \
+  --recursive
+
+# Windows PowerShell
+python .\oss_download.py download `
+  --source oss://bucket/path/to/prefix `
+  --destination C:\path\to\downloads `
+  --recursive
+```
+
+断点状态默认放在目标旁的 `.oss-download/`（`checkpoints/`）；也可显式指定 `--checkpoint-dir`。在 v2 中，显式指定 `--update` 可跳过本地较新的文件。`ossutil` 负责传输重试、分片、CRC 和断点恢复；本项目不自行计算 MD5。
+
+### 并发、过滤与演练
+
+按需显式调整 ossutil 参数：
+
+```bash
+./oss-download download --source oss://bucket/data --destination /data \
+  --recursive --jobs 4 --parallel 8 \
+  --include '*.bam' --include '*.bai' --exclude '*.tmp' \
+  --bigfile-threshold 100MB --part-size 10MB \
+  --maxdownspeed 5MB --dry-run --log /path/to/oss-download.log
+```
+
+`--maxdownspeed` 保留为本项目的易读参数名，但会传给 ossutil 2.x 的 `--bandwidth-limit`。`--parallel` 必须是正整数。`--force` 和 `--update` 也只有显式指定才会传给 ossutil；默认不会额外发出覆盖、删除或同步命令。`--dry-run` 可在实际下载前查看计划。日志只记录脱敏后的命令元数据、开始/结束事件和退出码，不记录 AccessKey ID 或 Secret。
+
+### 安全边界
+
+运行前会检查 `ossutil` 可执行文件、`oss://` source 格式，以及 destination 父目录是否可创建和写入。请先确认目标路径和过滤规则；所有实际传输行为、并发细节和退出状态以本机安装的官方 ossutil 2.x 版本为准。
