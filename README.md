@@ -98,7 +98,7 @@ CLI 使用纯 Python 标准库，不需要额外运行时依赖。
 
 ## OSS download（ossutil 2.x）
 
-`oss-download` 是跨 Linux、macOS 和 Windows 的仅下载封装，底层调用官方 Alibaba Cloud `ossutil` 2.x。它只执行下载方向的 `ossutil cp`，不上传、不删除、不执行 OSS-to-OSS copy，也不会自动启用 destructive 选项。
+`oss-download` 是跨 Linux、macOS 和 Windows 的 OSS 封装，底层调用官方 Alibaba Cloud `ossutil` 2.x。`download` 只执行下载方向的 `ossutil cp`；`ls` 只执行只读的 `ossutil ls`。本项目不上传、不删除、不执行 OSS-to-OSS copy，也不会自动启用 destructive 选项。
 
 ### 配置凭据
 
@@ -138,6 +138,32 @@ python .\oss_download.py download `
 
 断点状态默认放在目标旁的 `.oss-download/`（`checkpoints/`）；也可显式指定 `--checkpoint-dir`。在 v2 中，显式指定 `--update` 可跳过本地较新的文件。`ossutil` 负责传输重试、分片、CRC 和断点恢复；本项目不自行计算 MD5。
 
+### 只读列表（`ls`）
+
+`ls` 只查询 OSS 对象，不需要本地 `--destination`，不会下载、上传、删除或修改远端数据。`--source` 仍必须是 `oss://bucket[/prefix]`；ossutil 的标准输出和错误输出会实时转发，命令返回 ossutil 的原始退出码。
+
+```bash
+# Linux/macOS：递归列出对象并筛选，输出 JSON
+./oss-download ls \
+  --source oss://bucket/data \
+  --recursive \
+  --include '*.bam' --include '*.bai' \
+  --exclude '*.tmp' \
+  --output-format json \
+  --output-query 'Contents[].Key' \
+  --config-file /path/to/ossutil.ini \
+  --profile work \
+  --log /path/to/oss-list.log
+
+# Windows PowerShell
+python .\oss_download.py ls `
+  --source oss://bucket/data `
+  --output-format text `
+  --all-versions
+```
+
+`--output-format` 仅接受 `json`、`yaml`、`xml`、`text`；`--include` 和 `--exclude` 可重复指定，`--all-versions` 用于请求历史版本。`--log` 只记录脱敏后的命令元数据、开始/结束事件和退出码；ls 不接受任何 Secret 参数，也不会把凭据写入命令行或日志。
+
 ### 并发、过滤与演练
 
 按需显式调整 ossutil 参数：
@@ -154,4 +180,4 @@ python .\oss_download.py download `
 
 ### 安全边界
 
-运行前会检查 `ossutil` 可执行文件、`oss://` source 格式，以及 destination 父目录是否可创建和写入。请先确认目标路径和过滤规则；所有实际传输行为、并发细节和退出状态以本机安装的官方 ossutil 2.x 版本为准。
+运行前会检查 `ossutil` 可执行文件和 `oss://` source 格式。`download` 另外检查 destination 父目录是否可创建和写入；`ls` 不创建下载目录，只在显式指定 `--log` 时写入本地元数据日志。请先确认目标路径和过滤规则；所有实际传输、列表行为、并发细节和退出状态以本机安装的官方 ossutil 2.x 版本为准。

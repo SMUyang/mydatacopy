@@ -32,7 +32,7 @@ def _parallel(value: str) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="oss-download",
-        description="Download objects from Alibaba Cloud OSS with ossutil 2.x.",
+        description="List or download objects from Alibaba Cloud OSS with ossutil 2.x.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -75,6 +75,23 @@ def _build_parser() -> argparse.ArgumentParser:
     download.add_argument("--ossutil", default="ossutil", help="ossutil executable")
     download.add_argument("--log", type=Path, help="metadata log path")
     download.set_defaults(handler=_download)
+    ls = subparsers.add_parser("ls", help="list objects under an OSS path without changing data")
+    ls.add_argument("--source", required=True, help="OSS source (oss://bucket/key)")
+    ls.add_argument("--recursive", action="store_true", help="list objects recursively")
+    ls.add_argument("--include", action="append", default=[], help="include filter (repeatable)")
+    ls.add_argument("--exclude", action="append", default=[], help="exclude filter (repeatable)")
+    ls.add_argument(
+        "--output-format",
+        choices=("json", "yaml", "xml", "text"),
+        help="ossutil output format",
+    )
+    ls.add_argument("--output-query", help="JMESPath query for structured output")
+    ls.add_argument("--all-versions", action="store_true", help="include all object versions")
+    ls.add_argument("--config-file", type=Path, help="ossutil configuration file")
+    ls.add_argument("--profile", help="ossutil profile name")
+    ls.add_argument("--ossutil", default="ossutil", help="ossutil executable")
+    ls.add_argument("--log", type=Path, help="metadata log path")
+    ls.set_defaults(handler=_ls)
     return parser
 
 
@@ -207,6 +224,28 @@ def _build_download_command(args: argparse.Namespace, checkpoint: Path, executab
     return command
 
 
+def _build_ls_command(args: argparse.Namespace, executable: str) -> list[str]:
+    command = [executable, "ls"]
+    if args.recursive:
+        command.append("--recursive")
+    for pattern in args.include:
+        command.extend(["--include", pattern])
+    for pattern in args.exclude:
+        command.extend(["--exclude", pattern])
+    if args.output_format is not None:
+        command.extend(["--output-format", args.output_format])
+    if args.output_query is not None:
+        command.extend(["--output-query", args.output_query])
+    if args.all_versions:
+        command.append("--all-versions")
+    if args.config_file is not None:
+        command.extend(["--config-file", str(args.config_file)])
+    if args.profile is not None:
+        command.extend(["--profile", args.profile])
+    command.append(args.source)
+    return command
+
+
 def _download(args: argparse.Namespace) -> int:
     parser = _build_parser()
     _validate_source(args.source, parser)
@@ -239,6 +278,31 @@ def _download(args: argparse.Namespace) -> int:
         print(f"ERROR unable to start ossutil: {error}", file=sys.stderr)
         return 2
     _write_log(log_path, f"END exit={returncode}", access_key_id, access_key_secret)
+    return returncode
+
+
+def _ls(args: argparse.Namespace) -> int:
+    parser = _build_parser()
+    _validate_source(args.source, parser)
+    executable = _resolve_executable(args.ossutil)
+    if executable is None:
+        print(f"ERROR ossutil executable not found or not executable: {args.ossutil}", file=sys.stderr)
+        return 2
+
+    command = _build_ls_command(args, executable)
+    log_path = args.log
+    if log_path is not None:
+        _write_log(log_path, "START command=" + " ".join(command))
+    try:
+        process = subprocess.Popen(command)
+        returncode = process.wait()
+    except OSError as error:
+        if log_path is not None:
+            _write_log(log_path, f"END error={error} exit=2")
+        print(f"ERROR unable to start ossutil: {error}", file=sys.stderr)
+        return 2
+    if log_path is not None:
+        _write_log(log_path, f"END exit={returncode}")
     return returncode
 
 
